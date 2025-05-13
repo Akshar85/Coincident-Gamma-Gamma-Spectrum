@@ -123,11 +123,15 @@ class MainWindow(QMainWindow):
         self.data_x = np.array([], dtype=np.uint32)
         self.data_y = np.array([], dtype=np.uint32)
         self.data_z = np.array([], dtype=np.uint32)
-        self.view_mode = '3D Scatter'
+        self.view_mode = '3D Surface'  # Default to 3D Surface view
         
-        # Initialize the downsampling bins for heatmap
+        # Initialize the downsampling bins for heatmap and surface
         self.grid_bins = 256  # Default downsampled grid size
         self.grid_data = np.zeros((self.grid_bins, self.grid_bins), dtype=np.float32)
+        
+        # Surface plot smoothing settings
+        self.smooth_surface = True
+        self.surface_downsample = 4  # Default downsample factor for surface
         
         # Set up data reader thread
         self.data_reader = DataReaderThread()
@@ -187,17 +191,24 @@ class MainWindow(QMainWindow):
         # View mode selector
         top_controls.addWidget(QLabel("View Mode:"))
         self.view_mode_combo = QComboBox()
-        self.view_mode_combo.addItems(['3D Scatter', '2D Heatmap'])
+        self.view_mode_combo.addItems(['3D Surface', '3D Scatter', '2D Heatmap'])
+        self.view_mode_combo.setCurrentText(self.view_mode)
         self.view_mode_combo.currentTextChanged.connect(self.change_view_mode)
         top_controls.addWidget(self.view_mode_combo)
         
-        # Grid size control for heatmap
+        # Grid size control for heatmap and surface
         top_controls.addWidget(QLabel("Grid Size:"))
         self.grid_size_combo = QComboBox()
         self.grid_size_combo.addItems(['64', '128', '256', '512', '1024'])
         self.grid_size_combo.setCurrentText(str(self.grid_bins))
         self.grid_size_combo.currentTextChanged.connect(self.change_grid_size)
         top_controls.addWidget(self.grid_size_combo)
+        
+        # Add surface smoothing checkbox
+        self.smooth_checkbox = QCheckBox("Smooth Surface")
+        self.smooth_checkbox.setChecked(self.smooth_surface)
+        self.smooth_checkbox.stateChanged.connect(self.toggle_surface_smoothing)
+        top_controls.addWidget(self.smooth_checkbox)
         
         # Add top controls to main layout
         layout.addLayout(top_controls)
@@ -210,9 +221,16 @@ class MainWindow(QMainWindow):
         # Create 3D plot widget
         self.setup_3d_view()
         
+        # Create 3D surface widget
+        self.setup_surface_view()
+        
         # Create 2D heatmap widget (hidden initially)
         self.setup_2d_view()
         self.heatmap_widget.hide()
+        
+        # Show the default view (3D Surface)
+        self.gl_widget.hide()
+        self.surface_widget.show()
         
         # Statistics display
         stats_box = QGroupBox("Statistics")
@@ -236,7 +254,7 @@ class MainWindow(QMainWindow):
         self.update_timer.start(50)  # Update every 50ms
     
     def setup_3d_view(self):
-        """Set up the 3D visualization"""
+        """Set up the 3D scatter visualization"""
         self.gl_widget = gl.GLViewWidget()
         
         # Set up axes
@@ -253,11 +271,55 @@ class MainWindow(QMainWindow):
         )
         self.gl_widget.addItem(self.scatter)
         
+        # Add grid lines for better orientation
+        xgrid = gl.GLGridItem()
+        xgrid.setSize(x=DIM, y=DIM, z=0)
+        xgrid.setSpacing(x=DIM/10, y=DIM/10, z=0)
+        xgrid.translate(DIM/2, DIM/2, 0)
+        self.gl_widget.addItem(xgrid)
+        
         # Set camera position for better initial view
         self.gl_widget.setCameraPosition(distance=DIM*1.5, elevation=30, azimuth=45)
         
         # Add the GL widget to the plot layout
         self.plot_layout.addWidget(self.gl_widget)
+    
+    def setup_surface_view(self):
+        """Set up the 3D surface visualization"""
+        self.surface_widget = gl.GLViewWidget()
+        
+        # Set up axes
+        axis = gl.GLAxisItem()
+        axis.setSize(x=self.grid_bins, y=self.grid_bins, z=1000)
+        self.surface_widget.addItem(axis)
+        
+        # Create a grid for the surface
+        x = np.linspace(0, DIM, self.grid_bins // self.surface_downsample)
+        y = np.linspace(0, DIM, self.grid_bins // self.surface_downsample)
+        
+        # Initialize with zeros
+        z = np.zeros((len(y), len(x)))
+        
+        # Create the mesh surface
+        self.surface = gl.GLSurfacePlotItem(
+            x=x, y=y, z=z,
+            shader='shaded',
+            color=(0.5, 0.5, 1.0, 1.0)
+        )
+        self.surface_widget.addItem(self.surface)
+        
+        # Add grid lines for better orientation
+        xgrid = gl.GLGridItem()
+        xgrid.setSize(x=DIM, y=DIM, z=0)
+        xgrid.setSpacing(x=DIM/10, y=DIM/10, z=0)
+        xgrid.translate(DIM/2, DIM/2, 0)
+        self.surface_widget.addItem(xgrid)
+        
+        # Set camera position for better initial view
+        self.surface_widget.setCameraPosition(distance=DIM*1.5, elevation=30, azimuth=45)
+        
+        # Add the GL widget to the plot layout
+        self.plot_layout.addWidget(self.surface_widget)
     
     def setup_2d_view(self):
         """Set up the 2D heatmap visualization"""
@@ -282,8 +344,13 @@ class MainWindow(QMainWindow):
         # Add the heatmap widget to the plot layout
         self.plot_layout.addWidget(self.heatmap_widget)
     
+    def toggle_surface_smoothing(self, state):
+        """Toggle surface smoothing on/off"""
+        self.smooth_surface = (state == Qt.Checked)
+        self.update_display()
+    
     def change_grid_size(self, size_str):
-        """Change the grid size for the heatmap"""
+        """Change the grid size for the heatmap and surface"""
         self.grid_bins = int(size_str)
         # Reset the grid data with new size
         self.grid_data = np.zeros((self.grid_bins, self.grid_bins), dtype=np.float32)
@@ -294,6 +361,16 @@ class MainWindow(QMainWindow):
                 bin_y = int(y * self.grid_bins / DIM)
                 if 0 <= bin_x < self.grid_bins and 0 <= bin_y < self.grid_bins:
                     self.grid_data[bin_y, bin_x] = z
+        
+        # Update surface mesh grid
+        x = np.linspace(0, DIM, self.grid_bins // self.surface_downsample)
+        y = np.linspace(0, DIM, self.grid_bins // self.surface_downsample)
+        
+        # Downsample the grid data for surface
+        z = self.downsample_grid_for_surface()
+        
+        # Update surface
+        self.surface.setData(x=x, y=y, z=z)
     
     def start_acquisition(self):
         """Start data acquisition"""
@@ -325,12 +402,21 @@ class MainWindow(QMainWindow):
     def change_view_mode(self, mode):
         """Change the visualization mode"""
         self.view_mode = mode
+        # Hide all widgets
+        self.gl_widget.hide()
+        self.surface_widget.hide()
+        self.heatmap_widget.hide()
+        
+        # Show the selected widget
         if mode == '3D Scatter':
             self.gl_widget.show()
-            self.heatmap_widget.hide()
+        elif mode == '3D Surface':
+            self.surface_widget.show()
         else:  # 2D Heatmap
-            self.gl_widget.hide()
             self.heatmap_widget.show()
+        
+        # Show/hide surface-specific controls
+        self.smooth_checkbox.setVisible(mode == '3D Surface')
     
     def on_new_data(self, x_arr, y_arr, z_arr):
         """Handle new data points from the reader thread"""
@@ -345,7 +431,7 @@ class MainWindow(QMainWindow):
                 self.data_y = self.data_y[-MAX_DISPLAY_POINTS:]
                 self.data_z = self.data_z[-MAX_DISPLAY_POINTS:]
             
-            # Update the grid data for the heatmap
+            # Update the grid data for the heatmap and surface
             for x, y, z in zip(x_arr, y_arr, z_arr):
                 # Map x,y to grid bins
                 bin_x = int(x * self.grid_bins / DIM)
@@ -358,6 +444,43 @@ class MainWindow(QMainWindow):
         """Update statistics display"""
         self.points_label.setText(f"Points: {points}")
         self.rate_label.setText(f"Rate: {rate:.1f} points/sec")
+    
+    def smooth_grid_data(self, data, sigma=1.0):
+        """Apply Gaussian smoothing to grid data"""
+        from scipy.ndimage import gaussian_filter
+        return gaussian_filter(data, sigma=sigma)
+    
+    def downsample_grid_for_surface(self):
+        """Downsample the grid data for surface plot"""
+        # Get a copy of the grid data
+        z_data = self.grid_data.copy()
+        
+        if self.smooth_surface:
+            try:
+                # Apply smoothing if enabled
+                from scipy.ndimage import gaussian_filter
+                z_data = gaussian_filter(z_data, sigma=1.0)
+            except ImportError:
+                # If scipy is not available, simple smoothing
+                z_data = self.simple_smooth(z_data)
+        
+        # Log transform to enhance low values
+        z_data = np.log1p(z_data)  # log(1+x) to handle zeros
+        
+        # Downsample for surface plot (every Nth point)
+        ds = self.surface_downsample
+        downsampled = z_data[::ds, ::ds]
+        
+        return downsampled
+    
+    def simple_smooth(self, data, kernel_size=3):
+        """Simple smoothing using a box filter"""
+        result = np.zeros_like(data)
+        half = kernel_size // 2
+        for i in range(half, data.shape[0] - half):
+            for j in range(half, data.shape[1] - half):
+                result[i, j] = np.mean(data[i-half:i+half+1, j-half:j+half+1])
+        return result
     
     def update_display(self):
         """Update the visualization with current data"""
@@ -382,6 +505,38 @@ class MainWindow(QMainWindow):
                 
                 # Update the scatter plot
                 self.scatter.setData(pos=pos, color=colors, size=5)
+                
+            elif self.view_mode == '3D Surface':
+                # Downsample and prepare data for surface plot
+                z_data = self.downsample_grid_for_surface()
+                
+                # Create mesh grid
+                x = np.linspace(0, DIM, self.grid_bins // self.surface_downsample)
+                y = np.linspace(0, DIM, self.grid_bins // self.surface_downsample)
+                
+                # Update surface color based on z values
+                z_max = np.max(z_data)
+                if z_max > 0:
+                    # Create a color gradient based on height
+                    colors = np.zeros((z_data.shape[0], z_data.shape[1], 4))
+                    for i in range(z_data.shape[0]):
+                        for j in range(z_data.shape[1]):
+                            normalized_z = z_data[i, j] / z_max
+                            colors[i, j, 0] = 0.5 + 0.5 * normalized_z  # Red increases with height
+                            colors[i, j, 1] = 0.1 + 0.2 * (1-normalized_z)  # Green decreases with height
+                            colors[i, j, 2] = 0.8 - 0.6 * normalized_z  # Blue decreases with height
+                            colors[i, j, 3] = 1.0  # Alpha is always 1 (fully opaque)
+                    
+                    # Update the surface with new data and colors
+                    self.surface.setData(x=x, y=y, z=z_data, colors=colors)
+                else:
+                    # Just update z data if no significant values
+                    self.surface.setData(x=x, y=y, z=z_data)
+                
+                # Adjust the surface color based on max z value
+                color_intensity = min(1.0, 0.2 + 0.8 * (z_max / 10) if z_max > 0 else 0.2)
+                self.surface.setColor((color_intensity, 0.5, 1.0-color_intensity, 1.0))
+                
             else:  # 2D Heatmap
                 # Log scale for better visualization
                 display_data = np.log1p(self.grid_data)  # log(1+x) to handle zeros
