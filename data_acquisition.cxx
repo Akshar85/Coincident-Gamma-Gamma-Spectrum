@@ -5,181 +5,57 @@
 #include <chrono>
 #include <thread>
 #include <pigpio.h>
+#include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <fstream>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <cerrno>
 #include <cstring>
+#include <cerrno>
 
 using namespace std;
 using namespace chrono;
 
-// Constants
-const string DATA_PIPE_PATH = "/tmp/zdata_pipe";
-const string CONTROL_PIPE_PATH = "/tmp/daq_control_pipe";
 const int BIT_WIDTH = 13;
 const int TRIGGER_PIN = 19;
 const int X_PINS[BIT_WIDTH] = {18, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 27};
 const int Y_PINS[BIT_WIDTH] = {18, 23, 14, 15, 16, 17, 23, 20, 21, 21, 24, 25, 22};
 
-// Global variables
 atomic<bool> running(false);
-atomic<bool> program_running(true);
-vector<vector<uint64_t>> Z(8192, vector<uint64_t>(8192, 0));
 atomic<int> pulseCount(0);
-int data_pipe_fd = -1;
-int control_pipe_fd = -1;
 
-// Function prototypes
-void handleSignal(int signum);
-int generateDecimalFromBits(uint32_t data, const int* pins);
-void saveToCSV(const vector<vector<uint64_t>>& Z);
-void triggerCallback(int gpio, int level, uint32_t tick);
-void setupPipes();
-void commandListener();
-void processPulses();
-void cleanupAndExit();
+constexpr int DIM = 8192;
+constexpr const char* SHM_NAME = "/zdata_shared";
+uint64_t (*Z)[DIM] = nullptr;  // Pointer to shared memory matrix
 
-int main() {
-    // Set up signal handler for graceful termination
-    signal(SIGINT, handleSignal);
-    signal(SIGTERM, handleSignal);
-    
-    cout << "DAQ Program Starting..." << endl;
-    
-    // Initialize GPIO
-    if (gpioInitialise() < 0) {
-        cerr << "Failed to initialize GPIO" << endl;
+int kbhit() {
+    struct termios oldt, newt;
+    int ch;
+    int oldf;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+    ch = getchar();
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    fcntl(STDIN_FILENO, F_SETFL, oldf);
+    if (ch != EOF) {
+        ungetc(ch, stdin);
         return 1;
     }
-    
-    // Configure GPIO pins
-    for (int i = 0; i < BIT_WIDTH; ++i) {
-        gpioSetMode(X_PINS[i], PI_INPUT);
-        gpioSetPullUpDown(X_PINS[i], PI_PUD_DOWN);
-        gpioSetMode(Y_PINS[i], PI_INPUT);
-        gpioSetPullUpDown(Y_PINS[i], PI_PUD_DOWN);
-    }
-    
-    gpioSetMode(TRIGGER_PIN, PI_INPUT);
-    gpioSetPullUpDown(TRIGGER_PIN, PI_PUD_DOWN);
-    
-    // Set up named pipes
-    setupPipes();
-    
-    cout << "DAQ Program Ready" << endl;
-    cout << "Waiting for commands from Python interface..." << endl;
-    
-    // Start command listener thread
-    thread commandThread(commandListener);
-    
-    // Main loop - just keep program alive while threads do the work
-    while (program_running) {
-        this_thread::sleep_for(milliseconds(100));
-    }
-    
-    // Clean up
-    if (commandThread.joinable()) {
-        commandThread.join();
-    }
-    
-    cleanupAndExit();
-    
-    cout << "DAQ Program exited cleanly." << endl;
     return 0;
 }
 
-void setupPipes() {
-    // Create the data FIFO if it doesn't exist
-    if (mkfifo(DATA_PIPE_PATH.c_str(), 0666) == -1 && errno != EEXIST) {
-        perror("Failed to create data pipe");
-        exit(1);
-    }
-    
-    // Create the control FIFO if it doesn't exist
-    if (mkfifo(CONTROL_PIPE_PATH.c_str(), 0666) == -1 && errno != EEXIST) {
-        perror("Failed to create control pipe");
-        unlink(DATA_PIPE_PATH.c_str());
-        exit(1);
-    }
-    
-    // Open the data pipe for writing
-    cout << "Opening data pipe for writing..." << endl;
-    data_pipe_fd = open(DATA_PIPE_PATH.c_str(), O_WRONLY);
-    if (data_pipe_fd < 0) {
-        perror("Failed to open data pipe");
-        unlink(DATA_PIPE_PATH.c_str());
-        unlink(CONTROL_PIPE_PATH.c_str());
-        exit(1);
-    }
-    cout << "Data pipe opened successfully." << endl;
-    
-    // Open the control pipe for reading (non-blocking)
-    cout << "Opening control pipe for reading..." << endl;
-    control_pipe_fd = open(CONTROL_PIPE_PATH.c_str(), O_RDONLY | O_NONBLOCK);
-    if (control_pipe_fd < 0) {
-        perror("Failed to open control pipe");
-        close(data_pipe_fd);
-        unlink(DATA_PIPE_PATH.c_str());
-        unlink(CONTROL_PIPE_PATH.c_str());
-        exit(1);
-    }
-    cout << "Control pipe opened successfully." << endl;
-}
-
-void commandListener() {
-    char command;
-    while (program_running) {
-        int bytes_read = read(control_pipe_fd, &command, 1);
-        
-        if (bytes_read == 1) {
-            cout << "Received command: " << command << endl;
-            
-            switch (command) {
-                case 'T':
-                    cout << "Starting data acquisition..." << endl;
-                    gpioSetAlertFunc(TRIGGER_PIN, triggerCallback);
-                    running = true;
-                    break;
-                    
-                case 'P':
-                    cout << "Pausing data acquisition..." << endl;
-                    gpioSetAlertFunc(TRIGGER_PIN, nullptr);
-                    running = false;
-                    break;
-                    
-                case 'C':
-                    cout << "Clearing data..." << endl;
-                    Z.assign(8192, vector<uint64_t>(8192, 0));
-                    pulseCount = 0;
-                    break;
-                    
-                case 'S':
-                    cout << "Saving data to CSV..." << endl;
-                    saveToCSV(Z);
-                    break;
-                    
-                case 'X':
-                    cout << "Exiting program..." << endl;
-                    program_running = false;
-                    break;
-                    
-                default:
-                    cout << "Unknown command: " << command << endl;
-                    break;
-            }
-        }
-        
-        // Don't hog CPU
-        this_thread::sleep_for(milliseconds(50));
-    }
+char getKeyPress() {
+    return getchar();
 }
 
 void handleSignal(int signum) {
-    cout << "Received signal " << signum << endl;
-    program_running = false;
+    running = false;
 }
 
 int generateDecimalFromBits(uint32_t data, const int* pins) {
@@ -191,42 +67,18 @@ int generateDecimalFromBits(uint32_t data, const int* pins) {
     return result;
 }
 
-void saveToCSV(const vector<vector<uint64_t>>& Z) {
+void saveToCSV() {
     ofstream file("output_z_data.csv");
-    file << "X,Y,Z" << endl;
-    
-    // Count points for progress reporting
-    uint64_t total_points = 0;
-    uint64_t points_written = 0;
-    
-    // First count non-zero points
-    for (int x = 0; x < 8192; ++x) {
-        for (int y = 0; y < 8192; ++y) {
+    file << "X,Y,Z\n";
+    for (int x = 0; x < DIM; ++x) {
+        for (int y = 0; y < DIM; ++y) {
             if (Z[x][y] != 0) {
-                total_points++;
+                file << x << "," << y << "," << Z[x][y] << "\n";
             }
         }
     }
-    
-    cout << "Writing " << total_points << " points to CSV..." << endl;
-    
-    // Write the data
-    for (int x = 0; x < 8192; ++x) {
-        for (int y = 0; y < 8192; ++y) {
-            if (Z[x][y] != 0) {
-                file << x << "," << y << "," << Z[x][y] << endl;
-                points_written++;
-                
-                // Report progress periodically
-                if (points_written % 10000 == 0) {
-                    cout << "Progress: " << (points_written * 100 / total_points) << "%" << endl;
-                }
-            }
-        }
-    }
-    
     file.close();
-    cout << "Data saved to output_z_data.csv" << endl;
+    cout << "\nSaved data to output_z_data.csv\n";
 }
 
 void triggerCallback(int gpio, int level, uint32_t tick) {
@@ -234,34 +86,131 @@ void triggerCallback(int gpio, int level, uint32_t tick) {
         uint32_t data = gpioRead_Bits_0_31();
         int x = generateDecimalFromBits(data, X_PINS);
         int y = generateDecimalFromBits(data, Y_PINS);
-        
-        if (x < 8192 && y < 8192) {
-            Z[x][y]++;
+        if (x < DIM && y < DIM) {
+            __sync_fetch_and_add(&Z[x][y], 1); // Thread-safe increment
+            //cout<< "X=" << x << " Y=" << y;
             pulseCount++;
-            
-            // Send data to Python via pipe
-            uint32_t triplet[3] = {
-                static_cast<uint32_t>(x),
-                static_cast<uint32_t>(y),
-                static_cast<uint32_t>(Z[x][y])
-            };
-            
-            write(data_pipe_fd, triplet, sizeof(triplet));
         }
     }
 }
 
-void cleanupAndExit() {
-    // Clean up GPIO
+int main() {
+    signal(SIGINT, handleSignal);
+
+    // Setup shared memory
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        cerr << "Failed to open shared memory: " << strerror(errno) << endl;
+        return 1;
+    }
+
+    size_t shm_size = sizeof(uint64_t) * DIM * DIM;
+    if (ftruncate(shm_fd, shm_size) == -1) {
+        cerr << "Failed to set size: " << strerror(errno) << endl;
+        return 1;
+    }
+
+    void* shm_ptr = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+        cerr << "Failed to map shared memory: " << strerror(errno) << endl;
+        return 1;
+    }
+
+    Z = reinterpret_cast<uint64_t(*)[DIM]>(shm_ptr);
+    memset(Z, 0, shm_size);  // Clear data
+
+    // Setup GPIO
+    if (gpioInitialise() < 0) {
+        cerr << "Failed to initialize GPIO\n";
+        return 1;
+    }
+
+    for (int i = 0; i < BIT_WIDTH; ++i) {
+        gpioSetMode(X_PINS[i], PI_INPUT);
+        gpioSetPullUpDown(X_PINS[i], PI_PUD_DOWN);
+        gpioSetMode(Y_PINS[i], PI_INPUT);
+        gpioSetPullUpDown(Y_PINS[i], PI_PUD_DOWN);
+    }
+
+    gpioSetMode(TRIGGER_PIN, PI_INPUT);
+    gpioSetPullUpDown(TRIGGER_PIN, PI_PUD_DOWN);
+
+    auto lastTime = steady_clock::now();
+    int lastCount = 0;
+
+    cout << "DAQ Control Program (Shared Memory)\n";
+    cout << "Commands:\n";
+    cout << "  T: Start data acquisition\n";
+    cout << "  P: Pause data acquisition\n";
+    cout << "  C: Clear data\n";
+    cout << "  X: Exit program\n";
+
+    while (true) {
+        if (kbhit()) {
+            char ch = getKeyPress();
+            switch (ch) {
+                case 'x': case 'X':
+                    running = false;
+                    goto exit_loop;
+                case 't': case 'T':
+                    gpioSetAlertFunc(TRIGGER_PIN, triggerCallback);
+                    running = true;
+                    break;
+                case 'p': case 'P':
+                    gpioSetAlertFunc(TRIGGER_PIN, nullptr);
+                    running = false;
+                    break;
+                case 'c': case 'C':
+                    memset(Z, 0, shm_size);
+                    cout << "\nCleared all Z values.\n";
+                    break;
+            }
+        }
+
+        if (running) {
+            auto now = steady_clock::now();
+            if (duration_cast<seconds>(now - lastTime).count() >= 1) {
+                int currentCount = pulseCount.load();
+                int freq = currentCount - lastCount;
+                lastCount = currentCount;
+                lastTime = now;
+                cout << "\rCurrent Frequency: " << freq << " Hz   " << flush;
+            }
+        }
+
+        this_thread::sleep_for(milliseconds(1));
+    }
+
+exit_loop:
     gpioSetAlertFunc(TRIGGER_PIN, nullptr);
     gpioTerminate();
-    
-    // Close and remove pipes
-    if (data_pipe_fd >= 0) {
-        close(data_pipe_fd);
+
+    cout << "\n\nStopped by user.\n";
+    cout << "Do you want to save the data to CSV? (y/n): ";
+    char opt;
+    cin >> opt;
+    if (opt == 'y' || opt == 'Y') {
+        saveToCSV();
     }
-    
-    if (control_pipe_fd >= 0) {
-        close(control_pipe_fd);
+
+    cout << "Do you want to see non-zero data? (y/n): ";
+    cin >> opt;
+    if (opt == 'y' || opt == 'Y') {
+        for (int i = 0; i < DIM; ++i) {
+            for (int j = 0; j < DIM; ++j) {
+                if (Z[i][j] != 0) {
+                    cout << i << "," << j << "," << Z[i][j] << "\n";
+                }
+            }
+        }
     }
+
+    // 💡 Unmap and clean up shared memory after all access
+    munmap(Z, shm_size);
+    close(shm_fd);
+    shm_unlink(SHM_NAME);
+
+    cout << "Program exited cleanly.\n";
+    return 0;
+
 }
