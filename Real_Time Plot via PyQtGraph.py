@@ -239,20 +239,22 @@ class MainWindow(QMainWindow):
         """Set up the 3D visualization"""
         self.gl_widget = gl.GLViewWidget()
         
-        # Set up the 3D grid
-        self.gl_grid = gl.GLGridItem()
-        self.gl_grid.setSize(x=DIM, y=DIM)
-        self.gl_grid.setSpacing(x=DIM/10, y=DIM/10)
-        self.gl_widget.addItem(self.gl_grid)
-        
         # Set up axes
         axis = gl.GLAxisItem()
         axis.setSize(x=DIM, y=DIM, z=1000)
         self.gl_widget.addItem(axis)
         
-        # Set up the 3D scatter plot
-        self.scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3)), color=(0.2, 0.8, 0.5, 1), size=2)
+        # Set up the 3D scatter plot with improved settings
+        self.scatter = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3)), 
+            color=(0.2, 0.8, 0.5, 1), 
+            size=5,  # Increased point size for better visibility
+            pxMode=True  # Use pixel mode for consistent point size
+        )
         self.gl_widget.addItem(self.scatter)
+        
+        # Set camera position for better initial view
+        self.gl_widget.setCameraPosition(distance=DIM*1.5, elevation=30, azimuth=45)
         
         # Add the GL widget to the plot layout
         self.plot_layout.addWidget(self.gl_widget)
@@ -370,10 +372,16 @@ class MainWindow(QMainWindow):
                 # Normalize z values for color mapping
                 z_max = max(1, np.max(self.data_z))
                 z_norm = self.data_z / z_max
-                colors = np.column_stack((z_norm, 1-z_norm, np.zeros_like(z_norm), np.ones_like(z_norm)))
+                
+                # Improved color mapping with better visibility
+                colors = np.zeros((len(z_norm), 4))
+                colors[:, 0] = z_norm  # Red channel
+                colors[:, 1] = 0.5 * (1-z_norm)  # Green channel
+                colors[:, 2] = 1-z_norm  # Blue channel
+                colors[:, 3] = 1.0  # Alpha channel (full opacity)
                 
                 # Update the scatter plot
-                self.scatter.setData(pos=pos, color=colors, size=2)
+                self.scatter.setData(pos=pos, color=colors, size=5)
             else:  # 2D Heatmap
                 # Log scale for better visualization
                 display_data = np.log1p(self.grid_data)  # log(1+x) to handle zeros

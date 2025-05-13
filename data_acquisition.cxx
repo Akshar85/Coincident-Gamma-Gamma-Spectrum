@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>  // Added for system function
 
 using namespace std;
 using namespace chrono;
@@ -143,7 +144,11 @@ int main() {
     cout << "  T: Start data acquisition\n";
     cout << "  P: Pause data acquisition\n";
     cout << "  C: Clear data\n";
+    cout << "  V: Launch visualization\n";  // Added visualization option
     cout << "  X: Exit program\n";
+
+    // Check if visualization is already running
+    bool vis_running = false;
 
     while (true) {
         if (kbhit()) {
@@ -163,6 +168,20 @@ int main() {
                 case 'c': case 'C':
                     memset(Z, 0, shm_size);
                     cout << "\nCleared all Z values.\n";
+                    break;
+                case 'v': case 'V':
+                    if (!vis_running) {
+                        // Launch the visualization in a separate process
+                        cout << "\nLaunching visualization...\n";
+                        #ifdef _WIN32
+                            system("start python \"Real_Time Plot via PyQtGraph.py\"")
+                        #else
+                            system("python3 \"Real_Time Plot via PyQtGraph.py\" &");
+                        #endif
+                        vis_running = true;
+                    } else {
+                        cout << "\nVisualization already running.\n";
+                    }
                     break;
             }
         }
